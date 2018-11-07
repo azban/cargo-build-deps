@@ -1,120 +1,118 @@
-extern crate toml;
+extern crate cargo;
 extern crate clap;
 
-use std::env;
-use std::io::prelude::*;
-use std::fs::File;
-use toml::Value as Toml;
-use std::process::Command;
 use clap::{App, Arg};
+use cargo::{CargoError, CargoResult, Config};
+use cargo::ops::{compile_with_exec, CompileOptions};
+use cargo::core::{PackageId, Target, Workspace, Verbosity};
+use cargo::core::compiler::{CompileMode, DefaultExecutor, Executor};
+use cargo::util::ProcessBuilder;
+use cargo::util::important_paths::find_root_manifest_for_wd;
+use std::env;
+use std::path::Path;
+use std::sync::Arc;
+use std::fs::OpenOptions;
+
+fn touch_fingerprint(cmd: ProcessBuilder, id: &PackageId) {
+    let mut crate_name = String::new();
+    let mut crate_type = String::new();
+    let mut out_dir = String::new();
+    let mut extra_filename = String::new();
+    // Don't support OsString for now by casting to String
+    let args = cmd
+        .get_args()
+        .iter()
+        .map(|x| x.clone().into_string().unwrap())
+        .collect::<Vec<String>>();
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--crate-name" {
+            crate_name = args[i + 1].clone();
+        } else if arg == "--crate-type" {
+            crate_type = args[i + 1].clone();
+        } else {
+            if arg.starts_with("extra-filename") {
+                extra_filename = arg
+                    .split("=")
+                    .collect::<Vec<&str>>()[1]
+                    .to_string();
+            } else if arg.starts_with("dependency") {
+                out_dir = arg
+                    .split("=")
+                    .collect::<Vec<&str>>()[1]
+                    .to_string();
+            }
+        }
+    }
+    if crate_name == "build_script_build" {
+        crate_type = "build-script".to_string();
+    }
+    let package_name = id.name();
+    let file_path = format!(
+        "{}/../.fingerprint/{}{}/dep-{}-{}{}",
+        out_dir,
+        package_name,
+        extra_filename,
+        crate_type,
+        crate_name,
+        extra_filename,
+    );
+    //println!("{}", file_path);
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(Path::new(file_path.as_str()))
+        .unwrap();
+}
+
+struct BuildDepsExecutor;
+
+impl Executor for BuildDepsExecutor {
+    fn exec(
+        &self,
+        cmd: ProcessBuilder,
+        _id: &PackageId,
+        _target: &Target,
+        _mode: CompileMode,
+    ) -> CargoResult<()> {
+        if !_id.source_id().is_path() {
+            cmd.exec()?;
+        } else {
+            println!("Skipping {}", _id.name());
+            touch_fingerprint(cmd, _id);
+        }
+        Ok(())
+    }
+}
+
+fn build_deps(cwd: &Path, release: bool, deps_only: bool) -> Result<(), CargoError> {
+    let config = Config::default()?;
+    config.shell().set_verbosity(Verbosity::Normal);
+    let manifest = find_root_manifest_for_wd(&cwd)?;
+    let ws = Workspace::new(&manifest, &config)?;
+
+    let mut options = CompileOptions::new(&config, CompileMode::Build)?;
+    options.build_config.release = release;
+    let exec : Arc<Executor> = match deps_only {
+        true => Arc::new(BuildDepsExecutor),
+        false => Arc::new(DefaultExecutor),
+    };
+    match compile_with_exec(&ws, &options, &exec) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e)
+    }
+}
 
 fn main() {
-
     let matched_args = App::new("cargo build-deps")
         .arg(Arg::with_name("build-deps"))
         .arg(Arg::with_name("release").long("release"))
+        .arg(Arg::with_name("build-all").long("build-all"))
         .get_matches();
-
-    let is_release = matched_args.is_present("release");
-
-    execute_command(Command::new("cargo").arg("update"));
-
-    let cargo_toml = get_toml("Cargo.toml");
-    let top_pkg_name = parse_package_name(&cargo_toml);
-
-    let cargo_lock = get_toml("Cargo.lock");
-    let deps = parse_deps(&cargo_lock, top_pkg_name);
-
-    println!("building packages: {:?}", deps);
-
-    for dep in deps {
-        build_package(&dep, is_release);
-    }
-
-    println!("done");
-}
-
-fn get_toml(file_path: &str) -> Toml {
-    let mut toml_file = File::open(file_path).unwrap();
-    let mut toml_string = String::new();
-    toml_file.read_to_string(&mut toml_string).unwrap();
-    toml_string.parse().expect("failed to parse toml")
-}
-
-fn parse_package_name(toml: &Toml) -> &str {
-    match toml {
-        &Toml::Table(ref table) => {
-            match table.get("package") {
-                Some(&Toml::Table(ref table)) => {
-                    match table.get("name") {
-                        Some(&Toml::String(ref name)) => name,
-                        _ => panic!("failed to parse name"),
-                    }
-                }
-                _ => panic!("failed to parse package"),
-            }
-        }
-        _ => panic!("failed to parse Cargo.toml: incorrect format"),
-    }
-}
-
-fn parse_deps<'a>(toml: &'a Toml, top_pkg_name: &str) -> Vec<String> {
-    match toml.get("package") {
-        Some(&Toml::Array(ref pkgs)) => {
-            let top_pkg = pkgs.iter()
-                .find(|pkg| pkg.get("name").unwrap().as_str().unwrap() == top_pkg_name);
-            match top_pkg {
-                Some(&Toml::Table(ref pkg)) => {
-                    match pkg.get("dependencies") {
-                        Some(&Toml::Array(ref deps_toml_array)) => {
-                            deps_toml_array.iter()
-                                .map(|value| {
-                                    let mut value_parts = value.as_str().unwrap().split(" ");
-                                    format!("{}:{}",
-                                            value_parts.next()
-                                                .expect("failed to parse name from depencency \
-                                                         string"),
-                                            value_parts.next()
-                                                .expect("failed to parse version from depencency \
-                                                         string"))
-                                })
-                                .collect()
-                        }
-                        _ => panic!("error parsing dependencies table"),
-                    }
-                }
-                _ => panic!("failed to find top package"),
-            }
-        }
-        _ => panic!("failed to find packages in Cargo.lock"),
-    }
-}
-
-fn build_package(pkg_name: &str, is_release: bool) {
-    println!("building package: {:?}", pkg_name);
-
-    let mut command = Command::new("cargo");
-
-    let command_with_args = command.arg("build").arg("-p").arg(pkg_name);
-
-    let command_with_args_2 = if is_release {
-        command_with_args.arg("--release")
-    } else {
-        command_with_args
-    };
-
-    execute_command(command_with_args_2);
-}
-
-fn execute_command(command: &mut Command) {
-    let mut child = command.envs(env::vars()).spawn().expect("failed to execute process");
-
-    let exit_status = child.wait().expect("failed to run command");
-
-    if !exit_status.success() {
-        match exit_status.code() {
-            Some(code) => panic!("Exited with status code: {}", code),
-            None => panic!("Process terminated by signal"),
-        }
+    let release = matched_args.is_present("release");
+    let deps_only = !matched_args.is_present("build-all");
+    let cwd = env::current_dir().unwrap();
+    match build_deps(&cwd, release, deps_only) {
+        Ok(_) => (),
+        Err(e) => println!("{}", e)
     }
 }
